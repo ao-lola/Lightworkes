@@ -39,22 +39,24 @@ const TEAMS = [
 // ── Gibberish / unrecognised input detection ─────────────────────────────────
 function isUnrecognisedInput(text) {
   const t = text.trim();
+  if (t.length < 20) return { bad: true, reason: "Input is too short to triage. Please paste the full client message or describe the issue in detail." };
 
-  // Must have at least 15 characters
-  if (t.length < 15) return { bad: true, reason: "Input is too short to triage. Please paste the full client message or describe the issue in detail." };
-
-  // Must have at least 3 real words
-  const words = t.match(/[a-zA-Z]{2,}/g) || [];
-  if (words.length < 3) return { bad: true, reason: "Not enough context to triage. Please describe the issue in a few sentences." };
-
-  // Catch pure keyboard mash: same character repeated 5+ times
-  if (/(.){5,}/.test(t.replace(/\s/g, ""))) return { bad: true, reason: "Input does not appear to be a real escalation message. Please paste the client's actual message." };
-
-  // Catch pure random letter strings with almost no vowels (e.g. "sdfkjhsdkjfh")
+  // Repeat character spam: e.g. "aaaaaaa" or "asdfasdf"
   const noSpaces = t.replace(/\s/g, "");
-  const vowels = (noSpaces.match(/[aeiou]/gi) || []).length;
-  const vowelRatio = vowels / noSpaces.length;
-  if (noSpaces.length > 20 && vowelRatio < 0.05) return { bad: true, reason: "Input contains unrecognised text. Please paste the actual client escalation message." };
+  const uniqueChars = new Set(noSpaces.toLowerCase()).size;
+  if (noSpaces.length > 15 && uniqueChars < 5) return { bad: true, reason: "Input does not appear to be a real escalation message. Please paste the client's actual message." };
+
+  // Keyboard mash: high ratio of uncommon letter combos
+  const mashPattern = /([qwrtypsdfghjklzxcvbnm]){3,}|[^a-zA-Z0-9\s.,!?'"-]{4,}/i;
+  if (mashPattern.test(t)) return { bad: true, reason: "Input contains unrecognised characters or keyboard noise. Please enter a real escalation message." };
+
+  // Too few real words (less than 4 dictionary-like tokens)
+  const words = t.match(/[a-zA-Z]{3,}/g) || [];
+  if (words.length < 4) return { bad: true, reason: "Not enough context to triage. Please describe the issue in full sentences." };
+
+  // No recognisable CS/property context at all
+  const hasContext = /tenant|client|property|building|flat|unit|lease|repair|message|felicity|response|issue|problem|complaint|urgent|request|contract|data|invoice|payment|support|broken|failed|error|not working|help/i.test(t);
+  if (!hasContext) return { bad: true, reason: "The input doesn't appear to relate to a property management or LightWork issue. Please paste the actual client escalation message." };
 
   return { bad: false };
 }
