@@ -103,158 +103,340 @@ const ROUTING_DESTINATIONS = {
 // CS work with a single click.
 function runTriageEngine(text, client, tier, arr, reporter, renewal, context, teamId) {
   const t = (text + " " + context).toLowerCase();
-  const c = client?.trim() || "the client";
   const team = TEAMS.find(tm => tm.id === teamId) || TEAMS[0];
   const now = new Date().toLocaleString("en-GB", { day:"numeric", month:"short", hour:"2-digit", minute:"2-digit" });
 
-  // ── Step 1: Signal detection ─────────────────────────────────────────────
-  // The engine scans for signals that indicate risk type and severity.
-  // Each pattern is drawn from real CS escalation patterns at SaaS companies.
+  // ── Extract named context for dynamic output generation ─────────────────────
+  const reporterName = reporter ? reporter.split(",")[0].trim() : "the client contact";
+  const reporterTitle = reporter && reporter.includes(",") ? reporter.split(",").slice(1).join(",").trim() : "client representative";
+  const clientName = client?.trim() || "the client";
+  const arrValue = arr ? arr.trim() : null;
+  const tierLabel = tier ? tier.trim() : null;
+  const renewalText = renewal ? renewal.trim() : null;
+  const isEnterprise = /enterprise/i.test(tier || "");
+  const isHighARR = arr && (parseInt(arr.replace(/[^0-9]/g,"")) >= 40000);
+  const isRenewalImminent = renewal && /week|month|30|60|90/i.test(renewal);
+  const isExec = /ceo|cto|coo|director|head of|vp |president|founder|owner|principal/i.test(reporter || "");
+  const isSeniorRole = isExec || /manager|lead|director/i.test(reporter || "");
+
+  // ── Signal detection ─────────────────────────────────────────────────────────
   const flags = {
     co:          /carbon monoxide|co alarm|monoxide/.test(t),
     gas:         /gas leak|smell.{0,10}gas|gas escape/.test(t),
-    fire:        /\bfire\b|smoke alarm|flames/.test(t),
-    electrical:  /electric shock|sparking|live wire|exposed wire|electrical hazard/.test(t),
+    fire:        /fire|smoke alarm|flames/.test(t),
+    electrical:  /electric shock|sparking|live wire|exposed wire/.test(t),
     leakLight:   /leak.{0,30}light|light.{0,30}leak|through the light|light fitting/.test(t),
     gdpr:        /ico|data protection|gdpr|information commissioner|wrong tenant|another tenant|someone else.{0,20}(name|details|rent|data)|data.{0,20}(breach|incident)/.test(t),
-    legalThreat: /solicitor|lawyer|legal action|sue\b|tribunal|compensation|withhold rent/.test(t),
+    legalThreat: /solicitor|lawyer|legal action|sue|tribunal|compensation|withhold rent/.test(t),
     noHeating:   /no heating|no hot water|heating.{0,15}(broken|not working|failed)|boiler.{0,10}(broken|not working)/.test(t),
-    vulnerable:  /elderly|vulnerable|heart condition|disabled/.test(t),
+    vulnerable:  /elderly|vulnerable|heart condition|disabled|alone|lives alone/.test(t),
     maintenance: /repair.{0,30}(not|no|never)|not.{0,20}(fixed|resolved|followed|booked)|still waiting|nobody.{0,20}(called|came)|mould|damp|leak/.test(t),
-    platform:    /not receiv|no reply|not replying|felicity.{0,20}(not|stopped|down)|outage|duplicate|same message|loop|offline|automation.{0,20}(drop|fell|fallen|rate)/.test(t),
-    badAdvice:   /wrong advice|incorrect advice|told.{0,20}to wait|told to ventilate|bad advice|wrong information/.test(t),
+    platform:    /not receiv|no reply|not replying|felicity.{0,20}(not|stopped|down)|outage|duplicate|same message|offline|automation.{0,20}(drop|fell|fallen|rate)/.test(t),
+    badAdvice:   /wrong advice|incorrect advice|told.{0,20}to wait|told to ventilate|bad advice|wrong information|incorrect guidance/.test(t),
     document:    /tenancy agreement|tenancy contract|lease.{0,15}copy|deposit certificate|rent statement/.test(t),
     mortgage:    /mortgage|deadline|expires|completion/.test(t),
-    billing:     /wrong charge|incorrect charge|overcharged|charged twice|arrears|outstanding balance/.test(t),
-    repeated:    /three times|3 times|twice|second time|again|repeated|multiple times|keep.{0,15}(telling|saying)/.test(t),
+    billing:     /wrong charge|incorrect charge|overcharged|charged twice|arrears/.test(t),
+    repeated:    /three times|3 times|twice|second time|again|repeated|multiple times/.test(t),
     churnRisk:   /cancel|switch off|reconsidering|not confident|pause.{0,20}rollout|made the right decision|questioning/.test(t),
-    execContact: /ceo|director|personally|senior|leadership/.test(t),
+    noEngineer:  /no engineer|engineer.{0,20}(not|never|hasn|dispatch)|not dispatched|nobody.{0,20}came/.test(t),
+    bypassed:    /called.{0,20}(office|directly|us)|contacted.{0,20}directly|rang us|phoned/.test(t),
+    floorInfo:   t.match(/(\d+)(st|nd|rd|th).{0,10}floor/) ? t.match(/(\d+)(st|nd|rd|th).{0,10}floor/)[0] : null,
+    tenantInfo:  t.match(/tenant.{0,60}(?:alone|elderly|floor|flat|unit|vulnerable)/) ? true : false,
   };
 
-  // ── Step 2: Severity classification ─────────────────────────────────────
-  // Priority is assigned based on risk type. Safety and legal exposure = P0.
-  // Operational failure with deadline = P1. Admin and workflow = P2/P3.
-  let severity, severityReason, sla;
+  // Extract specific numbers and facts from text
+  const automationMatch = text.match(/(\d+)%?\s*(?:to|down to|from.+?to)\s*(\d+)%/);
+  const unresolvedMatch = text.match(/(\d[\d,]*)\s*unresolved/i);
+  const buildingMatch = text.match(/(\d+)\s*(?:properties|buildings|units|sites)/i);
+  const requestCountMatch = text.match(/(two|three|four|five|2|3|4|5)\s*times?|(\d+)\s*(?:separate\s*)?requests?/i);
+  const flatMatch = text.match(/flat\s*(\w+)|unit\s*(\w+)/i);
+
+  // ── Severity + confidence ────────────────────────────────────────────────────
+  let severity, severityReason, sla, confidenceScore, confidenceReason;
+  const signals = [];
   if (flags.co || flags.gas || flags.fire || flags.electrical || flags.leakLight || flags.gdpr || (flags.noHeating && flags.vulnerable)) {
     severity = "P0";
     sla = "30-minute response · Immediate human escalation";
-    if (flags.co || flags.badAdvice) severityReason = "Felicity gave unsafe guidance during a carbon monoxide emergency. Tenant may still be in the property. Immediate safety and legal risk.";
-    else if (flags.gdpr) severityReason = "Personal tenant data sent to wrong recipient. GDPR breach — ICO notification may be required within 72 hours.";
-    else if (flags.gas) severityReason = "Active gas leak reported. Emergency services and evacuation required.";
-    else severityReason = "Active safety or legal risk detected. Immediate escalation required.";
-  } else if (flags.noHeating || flags.legalThreat || flags.churnRisk || flags.execContact || (flags.maintenance && flags.repeated) || (flags.document && flags.mortgage)) {
+    if (flags.co) {
+      signals.push("Carbon monoxide alarm detected in escalation text");
+      if (flags.badAdvice) signals.push("Felicity provided incorrect safety guidance — tenant advised to wait rather than evacuate");
+      if (flags.vulnerable) signals.push("Tenant described as elderly or vulnerable");
+      if (flags.noEngineer || context.toLowerCase().includes("no engineer")) signals.push("No engineer has been dispatched");
+      if (flags.bypassed) signals.push(`${reporterName} has contacted the office directly, bypassing standard support channels`);
+      if (flags.floorInfo) signals.push(`Tenant located on ${flags.floorInfo} — evacuation may be more complex`);
+      severityReason = `Carbon monoxide emergency with incorrect AI guidance${flags.vulnerable ? " affecting a vulnerable tenant" : ""}. Multiple compounding risk factors detected.`;
+      confidenceScore = 98;
+      confidenceReason = "Multiple high-confidence safety and legal risk signals detected simultaneously.";
+    } else if (flags.gdpr) {
+      signals.push("Personal tenant data sent to wrong recipient");
+      signals.push("ICO complaint explicitly threatened");
+      if (flags.repeated) signals.push("Second occurrence — pattern indicates systemic issue");
+      if (buildingMatch) signals.push(`${buildingMatch[0]} affected — broad scope increases breach severity`);
+      severityReason = "Personal data exposure with regulatory threat. ICO 72-hour notification window may have started.";
+      confidenceScore = 96;
+      confidenceReason = "GDPR breach indicators are explicit and unambiguous. Regulatory exposure is clear.";
+    } else {
+      signals.push("Active safety hazard detected");
+      severityReason = "Immediate safety or legal risk identified.";
+      confidenceScore = 90;
+      confidenceReason = "Safety signals detected in escalation text.";
+    }
+  } else if (flags.legalThreat || flags.churnRisk || isExec || (flags.maintenance && flags.repeated) || (flags.document && flags.mortgage)) {
     severity = "P1";
     sla = "2-hour response · CS Lead must own this today";
-    if (flags.churnRisk || flags.execContact) severityReason = "Executive contact or active churn signal. Account is at risk — requires senior CS response today.";
-    else if (flags.legalThreat) severityReason = "Legal action or rent withholding indicated. CS Lead and legal review required today.";
-    else if (flags.document && flags.mortgage) severityReason = "Document unresolved with mortgage deadline approaching. Same-day resolution required.";
-    else if (flags.noHeating) severityReason = "Heating or hot water failure. Tenant habitability at risk.";
-    else severityReason = "Repeated workflow failure or urgent operational issue affecting tenant welfare or client trust.";
+    if (flags.document && flags.mortgage) {
+      signals.push("Tenancy document request unresolved after multiple attempts");
+      signals.push("Mortgage application deadline creates hard time constraint");
+      if (requestCountMatch) signals.push(`${requestCountMatch[0]} requests made — repeated failure to action`);
+      if (flatMatch) signals.push(`Specific tenant identified: ${flatMatch[0]}`);
+      severityReason = "Document request with active mortgage deadline. Each hour of delay increases risk of financial harm to the tenant.";
+      confidenceScore = 92;
+      confidenceReason = "Mortgage deadline creates an objective, verifiable time constraint with clear financial consequence.";
+    } else if (isExec) {
+      signals.push(`${reporterTitle} has escalated directly — not a standard support contact`);
+      if (flags.churnRisk) signals.push("Language indicates active consideration of cancellation or rollout pause");
+      if (isRenewalImminent) signals.push(`Renewal ${renewalText} — commercial window is open`);
+      signals.push("Executive-level contact suggests internal escalation has already occurred");
+      severityReason = `${reporterTitle} engagement indicates the issue has reached leadership level at ${clientName}. Commercial and relationship risk is elevated.`;
+      confidenceScore = 89;
+      confidenceReason = "Executive contact combined with dissatisfaction language and renewal proximity are strong P1 indicators.";
+    } else if (flags.legalThreat) {
+      signals.push("Legal action or rent withholding explicitly threatened");
+      severityReason = "Legal threat requires CS Lead and potential legal review today.";
+      confidenceScore = 94;
+      confidenceReason = "Legal threat language is explicit and unambiguous.";
+    } else {
+      signals.push("Repeated workflow failure detected");
+      severityReason = "Escalating operational failure affecting client trust.";
+      confidenceScore = 82;
+      confidenceReason = "Repeated failure pattern and client frustration language detected.";
+    }
   } else if (flags.document || flags.billing || flags.maintenance || flags.platform) {
     severity = "P2";
     sla = "4-hour response · Assign and confirm same day";
-    if (flags.platform) severityReason = "Platform delivery issue — Felicity not responding or sending duplicate messages. Adoption impact.";
-    else if (flags.document) severityReason = "Admin or document request unresolved after multiple attempts. Workflow failure.";
-    else severityReason = "Standard operational issue requiring structured follow-up.";
+    if (flags.platform) {
+      signals.push("Platform delivery or automation failure detected");
+      if (automationMatch) signals.push(`Automation rate drop: ${automationMatch[0]}`);
+      if (unresolvedMatch) signals.push(`${unresolvedMatch[0]} queries reported unresolved`);
+      severityReason = "Platform operational failure with measurable client impact.";
+      confidenceScore = 85;
+      confidenceReason = "Platform failure signals with quantified impact metrics detected.";
+    } else {
+      signals.push("Workflow or admin failure without immediate safety or legal risk");
+      severityReason = "Standard operational issue requiring structured follow-up.";
+      confidenceScore = 78;
+      confidenceReason = "Issue is clearly defined but no urgent risk indicators detected.";
+    }
   } else {
     severity = "P3";
     sla = "1 business day · Standard response";
-    severityReason = "Low-urgency query or general feedback. No immediate risk detected.";
+    signals.push("No high-priority risk signals detected");
+    severityReason = "Low-urgency query or general feedback.";
+    confidenceScore = 70;
+    confidenceReason = "No elevated risk signals found. Standard triage applied.";
   }
 
-  // ── Step 3: Risk category ────────────────────────────────────────────────
+  // ── Risk category ──────────────────────────────────────────────────────────
   let riskCategory;
   if (flags.co || flags.gas || flags.fire || flags.electrical || flags.leakLight || (flags.noHeating && flags.vulnerable)) riskCategory = "Safety";
   else if (flags.gdpr) riskCategory = "Data Protection";
   else if (flags.legalThreat) riskCategory = "Legal Risk";
-  else if (flags.churnRisk || flags.execContact) riskCategory = "Relationship Risk";
+  else if (flags.churnRisk || isExec) riskCategory = "Relationship Risk";
   else if (flags.platform) riskCategory = "Platform Failure";
   else if (flags.badAdvice) riskCategory = "AI Behaviour";
   else if (flags.maintenance) riskCategory = "Maintenance";
   else if (flags.document || flags.billing) riskCategory = "Workflow Failure";
   else riskCategory = "General";
 
-  // ── Step 4: Routing ──────────────────────────────────────────────────────
-  // The engine recommends both the selected team and any additional teams
-  // that should be looped in based on the issue type.
+  // ── Additional teams ────────────────────────────────────────────────────────
   let additionalTeams = [];
   if (flags.gdpr || flags.legalThreat) additionalTeams = ["Legal / DPO"];
   else if (flags.co || flags.badAdvice) additionalTeams = ["Engineering", "Product"];
   else if (flags.platform) additionalTeams = ["Engineering"];
-  if (additionalTeams.includes(team.label)) additionalTeams = additionalTeams.filter(t => t !== team.label);
+  additionalTeams = additionalTeams.filter(t => t !== team.label);
 
-  // ── Step 5: Impact statements ────────────────────────────────────────────
-  let customerImpact, tenantImpact;
-  if (flags.co && flags.badAdvice) {
-    customerImpact = `${c} faces direct reputational and legal liability. Felicity gave incorrect safety guidance during an active emergency. If harm comes to the tenant, both ${c} and LightWork AI are exposed.`;
-    tenantImpact = "Tenant may still be in a property with an active CO alarm following incorrect AI guidance. Evacuation may not have occurred. This is a life-safety situation.";
-  } else if (flags.gdpr) {
-    customerImpact = `${c} faces regulatory exposure under GDPR. An ICO complaint has been threatened. Failure to act within 72 hours may result in mandatory breach notification and potential fines.`;
-    tenantImpact = "Tenant has had personal financial data exposed to another resident. They are distressed and have threatened regulatory action.";
-  } else if (flags.churnRisk || flags.execContact) {
-    customerImpact = `${c}'s leadership is directly engaged and expressing dissatisfaction. Without a confident senior response today, this account — ${arr ? arr + " ARR" : "significant ARR"} — is at serious churn risk${renewal ? ` with renewal in ${renewal}` : ""}.`;
-    tenantImpact = "Platform performance is directly impacting tenant experience, driving escalations to the client's leadership team.";
-  } else if (flags.document && flags.mortgage) {
-    customerImpact = `${c} is managing a tenant with a time-critical mortgage deadline. Failure to resolve today could result in the tenant losing their mortgage offer — creating direct liability for ${c} and reputational damage for LightWork AI.`;
-    tenantImpact = "Tenant faces losing a mortgage offer due to an unresolved document request. Three previous requests have gone unanswered by the platform.";
-  } else if (flags.platform) {
-    customerImpact = `${c} is experiencing platform-wide failure — ${arr ? arr + " ARR" : "an active account"} at risk if not resolved urgently. Manual workload has increased significantly.`;
-    tenantImpact = "Tenants are not receiving responses from Felicity, creating frustration and increasing direct contact with the property management team.";
-  } else {
-    customerImpact = `${c} has raised a service issue requiring structured follow-up. Client confidence may be affected if not addressed promptly.`;
-    tenantImpact = "Tenant experience is being impacted. Continued delays may lead to direct complaints to the property manager.";
+  // ── Routing justification — specific per team ────────────────────────────────
+  const routingJustification = {};
+  if (flags.co || flags.badAdvice) {
+    routingJustification["Engineering"] = ["Investigate why Felicity provided incorrect safety guidance", "Review delivery pipeline for failed message confirmation", "Check if similar advice has been given to other tenants"];
+    routingJustification["Product"] = ["Felicity's response to CO alarm must be reviewed as a critical AI behaviour incident", "Safety scenario handling needs immediate audit across all active deployments"];
+  }
+  if (flags.gdpr) {
+    routingJustification["Engineering"] = ["Identify root cause of cross-tenant data exposure", "Audit message delivery logs to determine full breach scope"];
+    routingJustification["Legal / DPO"] = ["Begin 72-hour GDPR breach assessment", "Prepare ICO notification if required", "Document breach scope and containment steps"];
+  }
+  if (flags.platform) {
+    routingJustification["Engineering"] = [
+      automationMatch ? `Automation rate drop from ${automationMatch[0]} requires root cause analysis` : "Platform delivery failure requires immediate investigation",
+      "Check deployment logs — correlate with any recent releases",
+      unresolvedMatch ? `${unresolvedMatch[0]} unresolved queries indicates message queue issue` : "Message queue health check required"
+    ];
+  }
+  if (flags.document && flags.mortgage) {
+    routingJustification["Operations"] = ["Retrieve and manually send tenancy agreement today — do not re-route through Felicity", "Verify mortgage deadline and document directly to CRM"];
+  }
+  // Always add the selected team if not already covered
+  if (!routingJustification[team.label]) {
+    routingJustification[team.label] = [
+      `Primary owner for ${riskCategory.toLowerCase()} incidents`,
+      `${isSeniorRole ? `${reporterTitle} contact requires ${isEnterprise ? "senior" : "standard"} CS response` : "Account relationship management"}`,
+      isRenewalImminent ? `Renewal in ${renewalText} — commercial sensitivity is high` : "Account health monitoring required"
+    ];
   }
 
-  // ── Step 6: Follow-up checklist ──────────────────────────────────────────
-  const checklist = [];
-  if (flags.co || flags.gas || flags.fire) { checklist.push("Call client directly — do not rely on written communication for safety incidents"); checklist.push("Confirm tenant has evacuated and emergency services have been contacted"); checklist.push("Escalate Felicity's AI response to Product and Engineering immediately"); }
-  if (flags.gdpr) { checklist.push("Notify DPO within 1 hour — 72-hour ICO window starts now"); checklist.push("Identify scope of breach — how many records were affected?"); checklist.push("Prepare breach notification draft for ICO if required"); }
-  if (flags.churnRisk || flags.execContact) { checklist.push("CS Lead or VP to make direct contact with client executive today"); checklist.push("Prepare account health summary before the call"); }
-  if (flags.document && flags.mortgage) { checklist.push("Locate and send tenancy agreement today — do not delegate to Felicity"); checklist.push("Confirm mortgage deadline with tenant and document resolution"); }
-  if (flags.platform) { checklist.push("Check system status and recent deployments"); checklist.push("Quantify number of affected tenants and undelivered messages"); }
-  checklist.push(`Log this escalation in the CRM against ${c}`);
-  checklist.push("Send client acknowledgement within SLA window");
-  checklist.push("Schedule follow-up to confirm resolution");
+  // ── Business risk assessment ─────────────────────────────────────────────────
+  const businessRisk = (() => {
+    const parts = [];
+    if (arrValue) parts.push(`${arrValue} ARR is directly at risk${severity === "P0" || severity === "P1" ? " if this incident is not resolved within SLA" : ""}.`);
+    if (tierLabel && isHighARR) parts.push(`As an ${tierLabel} account, ${clientName} sits in the top tier of the portfolio and any churn or escalation will have disproportionate impact on portfolio ARR.`);
+    if (isRenewalImminent) parts.push(`Renewal is ${renewalText} away. This incident is occurring during an active commercial window — poor incident management at this stage materially increases the risk of non-renewal or downgrade.`);
+    if (isExec) parts.push(`${reporterName} is ${reporterTitle} at ${clientName}. Executive-level engagement at this stage suggests the issue has already been discussed internally. Recovery will require senior-to-senior relationship management.`);
+    if (flags.churnRisk) parts.push(`Language in the escalation suggests ${clientName} is actively reconsidering the rollout. This is not a retention risk — it is a live churn signal.`);
+    if (flags.gdpr) parts.push(`GDPR breach risk creates regulatory exposure independent of the commercial relationship. ICO fines and reputational damage could extend beyond this account.`);
+    if (!parts.length) parts.push(`No immediate commercial risk beyond standard SLA compliance. Monitor for escalation signals over the next 30 days.`);
+    return parts.join(" ");
+  })();
 
-  // ── Step 7: Recommended actions ──────────────────────────────────────────
-  const actions = [];
-  if (severity === "P0") actions.push(`Call ${reporter ? reporter.split(",")[0] : "client contact"} immediately — do not rely on email for P0`);
-  if (flags.co || flags.badAdvice) actions.push("Escalate Felicity's AI response to Engineering and Product — log as critical AI behaviour incident");
-  if (flags.gdpr) actions.push("Notify DPO now — begin 72-hour GDPR breach assessment");
-  if (flags.churnRisk || flags.execContact) actions.push(`Arrange senior CS or VP call with ${c} leadership this week`);
-  if (flags.document && flags.mortgage) actions.push("Retrieve and send the tenancy agreement today — bypass Felicity workflow");
-  if (flags.platform) actions.push("Check deployment logs and system status — identify root cause of delivery failure");
-  actions.push(`Route to ${team.label}${additionalTeams.length ? " + " + additionalTeams.join(" + ") : ""}`);
-  actions.push("Send holding message to client within SLA window");
+  // ── Dynamic customer impact ──────────────────────────────────────────────────
+  const customerImpact = (() => {
+    if (flags.co && flags.bypassed) return `${reporterName} has bypassed standard support channels and called the office directly — a clear signal of lost confidence in the platform's ability to handle this incident. As ${reporterTitle}, they are likely to escalate internally to ${clientName}'s leadership if they do not receive an immediate senior-level response. The nature of the incident — a safety failure combined with incorrect AI guidance — creates both reputational and legal exposure for ${clientName}.`;
+    if (flags.gdpr) return `${clientName} now faces regulatory exposure that sits outside the normal CS relationship. ${reporterName} has explicitly mentioned the ICO — this is not a threat being made lightly. With ${buildingMatch ? buildingMatch[0] + " affected" : "multiple units potentially affected"}, the breach scope may require formal notification. ${arrValue ? `The ${arrValue} ARR relationship is secondary to the immediate legal risk.` : ""}`;
+    if (flags.document && flags.mortgage) return `${reporterName} has made this a formal written complaint, not a support request. The tenant faces a direct financial consequence — losing a mortgage offer — that ${clientName} will hold LightWork partially responsible for. ${requestCountMatch ? `${requestCountMatch[0]} previous requests have gone unresolved.` : "Multiple previous requests have gone unanswered."} ${clientName}'s trust in Felicity's ability to handle admin workflows is eroding.`;
+    if (isExec) return `${reporterName} (${reporterTitle}) has engaged directly, which indicates this issue has already been discussed at ${clientName}'s leadership level before this message was sent. ${isRenewalImminent ? `With renewal ${renewalText} away, this is the worst possible moment for a relationship breakdown.` : ""} A delayed or junior response will confirm their concerns rather than resolve them.`;
+    if (flags.platform) return `${clientName}${automationMatch ? ` has seen their automation rate drop from ${automationMatch[0]}` : " is experiencing platform-wide delivery failures"}. ${unresolvedMatch ? `${unresolvedMatch[0]} unresolved queries` : "A growing backlog"} means their team is manually handling work the platform should be automating. The core value proposition of LightWork is being undermined in real time.`;
+    return `${reporterName} has raised a formal issue that requires a structured response. ${clientName} expects acknowledgement within the SLA window${isSeniorRole ? ` — ${reporterTitle} will be monitoring the response closely` : ""}. ${isRenewalImminent ? `Renewal in ${renewalText} makes timely resolution commercially important.` : ""}`;
+  })();
 
-  // ── Step 8: Draft outputs ─────────────────────────────────────────────────
-  // The engine generates a ready-to-send client email and internal escalation.
-  // Both are editable before copying.
-  const isUrgent = severity === "P0" || severity === "P1";
-  const clientReply = `Subject: Re: ${flags.co ? "Urgent — Carbon Monoxide Incident" : flags.gdpr ? "Urgent — Data Protection Incident" : flags.churnRisk || flags.execContact ? "Your feedback — personal response" : "Your recent escalation"} — ${c}
+  // ── Dynamic tenant impact ────────────────────────────────────────────────────
+  const tenantImpact = (() => {
+    if (flags.co) {
+      const location = flags.floorInfo ? ` on the ${flags.floorInfo}` : "";
+      const vuln = flags.vulnerable ? " The tenant has been described as elderly and living alone" : "";
+      const engineer = (flags.noEngineer || context.toLowerCase().includes("no engineer")) ? " No engineer has been dispatched." : "";
+      return `The tenant${location} may still be in a property with an active carbon monoxide alarm following incorrect guidance from Felicity.${vuln}.${engineer} Every minute without contact or evacuation increases the risk of serious harm and the legal exposure for all parties.`;
+    }
+    if (flags.gdpr) return `A tenant at ${clientName} has had their personal data — ${text.toLowerCase().includes("rent") ? "name, phone number, and outstanding rent balance" : "personal details"} — exposed to another resident. They are aware of the breach and have threatened regulatory action. Their trust in ${clientName}'s data handling has been broken.`;
+    if (flags.document && flags.mortgage) {
+      const tenantName = text.match(/Mr\.?\s+\w+|Ms\.?\s+\w+|Mrs\.?\s+\w+/) ? text.match(/Mr\.?\s+\w+|Ms\.?\s+\w+|Mrs\.?\s+\w+/)[0] : "The tenant";
+      return `${tenantName}${flatMatch ? ` in ${flatMatch[0]}` : ""} faces losing a mortgage offer if this document is not delivered today. ${requestCountMatch ? `They have made ${requestCountMatch[0]} requests` : "Multiple requests have been made"}, each time being told someone will follow up. The financial consequence of further delay is direct and measurable.`;
+    }
+    if (flags.platform && unresolvedMatch) return `Tenants across ${clientName}'s portfolio are waiting for responses that Felicity is failing to deliver. With ${unresolvedMatch[0]} queries unresolved, frustration is increasing and tenants are likely beginning to contact the property management team directly — adding to ${clientName}'s operational burden.`;
+    return `Tenant experience is being directly affected by this issue. Continued delays risk complaints being escalated beyond ${clientName} to the property manager or building owner.`;
+  })();
 
-Dear ${reporter ? reporter.split(",")[0] : "team"},
+  // ── Executive summary ────────────────────────────────────────────────────────
+  const executiveSummary = (() => {
+    if (flags.co) return `A${flags.vulnerable ? "n elderly" : ""} tenant${flags.floorInfo ? ` on the ${flags.floorInfo}` : ""} at ${clientName} remains in a property after a carbon monoxide alarm was triggered. Felicity provided incorrect guidance — advising the tenant to ventilate and wait rather than evacuate. No engineer has been dispatched. ${reporterName} (${reporterTitle}) has contacted the office directly, having lost confidence in the platform's handling. This incident creates simultaneous safety, legal, and reputational exposure for both ${clientName} and LightWork AI. Immediate human intervention is required.`;
+    if (flags.gdpr) return `A GDPR data breach has occurred at ${clientName}. A tenant received Felicity-generated communication containing another tenant's personal and financial data. ${flags.repeated ? "This is the second such incident in recent weeks, indicating a systemic issue rather than an isolated fault." : ""} ${reporterName} (${reporterTitle}) has threatened ICO notification. The 72-hour notification window may have started. ${buildingMatch ? `${clientName} manages ${buildingMatch[0]}, and the full scope of the breach has not yet been determined.` : ""} Legal and engineering review is required immediately.`;
+    if (flags.document && flags.mortgage) return `A tenant at ${clientName} is at risk of losing a mortgage offer due to an unresolved tenancy document request. ${requestCountMatch ? `${requestCountMatch[0].charAt(0).toUpperCase() + requestCountMatch[0].slice(1)} requests have been made` : "Multiple requests have been submitted"} through Felicity, each acknowledged but not actioned. ${reporterName} (${reporterTitle}) has escalated formally in writing. The mortgage deadline creates a hard time constraint — same-day resolution is required to prevent direct financial harm to the tenant and reputational damage to ${clientName}.`;
+    if (isExec) return `${reporterName}, ${reporterTitle} at ${clientName}, has personally escalated a service concern to LightWork. ${arrValue ? `This is an ${arrValue} ARR account` : `This is a ${tierLabel || "key"} account`}${isRenewalImminent ? ` with renewal due in ${renewalText}` : ""}. ${flags.churnRisk ? "Language in the escalation indicates active consideration of cancelling or pausing the rollout." : "The escalation indicates that confidence in the platform is declining at a leadership level."} A senior CS response is required today to stabilise the relationship before the renewal conversation.`;
+    if (flags.platform) return `${clientName} is experiencing a platform-level failure affecting Felicity's ability to respond to tenant queries. ${automationMatch ? `Automation rate has dropped from ${automationMatch[0]}.` : ""} ${unresolvedMatch ? `${unresolvedMatch[0]} queries are currently unresolved.` : ""} ${reporterName} (${reporterTitle}) has escalated formally. The root cause has not been identified. Engineering investigation is required to restore service and determine whether other accounts are affected.`;
+    return `${reporterName} (${reporterTitle}) at ${clientName} has raised a service issue requiring structured CS response. ${arrValue ? `This is a ${arrValue} ARR account` : ""}${isRenewalImminent ? ` with renewal in ${renewalText}` : ""}. Priority is ${severity} with SLA of ${sla.split("·")[0].trim()}.`;
+  })();
 
-Thank you for contacting us${isUrgent ? " — I want to personally assure you this is being treated as our highest priority" : ""}. I have read your message in full and I am taking immediate ownership of this.
+  // ── Suggested customer response — fully dynamic ──────────────────────────────
+  const suggestedResponse = (() => {
+    const firstName = reporterName.split(" ")[0];
+    const urgencyLine = severity === "P0" ? "We are treating this as a Priority 0 incident and have escalated it immediately to our most senior team." : severity === "P1" ? "We are treating this as a high-priority incident and have escalated it to our CS Lead immediately." : "We have logged this and assigned it to the right team for same-day follow-up.";
 
-${flags.co ? `The safety of your tenant is our first concern. I am escalating this to our engineering and product teams immediately to understand how Felicity responded in the way it did, and to ensure this does not happen again. Please confirm whether your tenant has now left the property and whether emergency services have attended.` : flags.gdpr ? `I understand the seriousness of what you have described. A data incident of this nature is unacceptable and I am treating it with the highest urgency. I have notified our Data Protection Officer and we are beginning an immediate investigation into the scope and cause of this incident. We will provide you with a full incident report within 24 hours.` : flags.churnRisk || flags.execContact ? `I hear your frustration and I want to be direct with you — the experience you have described is not the standard we hold ourselves to. I would like to speak with you personally this week to discuss what has gone wrong and what we are doing to fix it.` : flags.document && flags.mortgage ? `I understand the urgency here and I am not going to let this sit in a queue. I am personally retrieving the tenancy agreement and will ensure it reaches Mr Okonkwo today.` : `I have logged this as a priority issue and assigned it to our ${team.label} team for immediate review. You will hear from us with an update within ${severity === "P2" ? "4 hours" : "1 business day"}.`}
+    let bodyLine = "";
+    if (flags.co) bodyLine = `We are attempting to contact the tenant directly to confirm they have evacuated the property, and we are coordinating an urgent engineering response. In parallel, we are reviewing the guidance Felicity provided — if it was incorrect, that will be escalated to our product and engineering teams as a critical incident. A senior incident manager has been assigned and we will provide you with a full update within 30 minutes.`;
+    else if (flags.gdpr) bodyLine = `We have notified our Data Protection Officer and have begun an immediate investigation into how this occurred and the scope of data affected. We understand the seriousness of this — protecting your tenants' data is a fundamental responsibility and we take this breach very seriously. We will provide you with a full incident report within 24 hours and keep you updated as our investigation progresses.`;
+    else if (flags.document && flags.mortgage) bodyLine = `I have personally escalated this to ensure the tenancy agreement is retrieved and sent to the tenant today — I will not route this back through the standard queue. Please ask the tenant to expect it by ${new Date(Date.now()+4*3600000).toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})} at the latest. I will confirm directly with you once it has been sent.`;
+    else if (isExec) bodyLine = `I hear your frustration and I want to be direct with you: the experience you have described is not the standard we hold ourselves to. I would like to speak with you personally this week — not to explain what went wrong, but to show you what we are doing to fix it. I am clearing time in my calendar and will send you a meeting request within the hour.`;
+    else if (flags.platform) bodyLine = `Our engineering team is investigating the root cause now. ${automationMatch ? `We are aware that your automation rate has dropped and understand the manual burden this is creating for your team.` : ""} I will update you every 30 minutes until service is restored and will send a full incident report once we have a root cause confirmed.`;
+    else bodyLine = `I have assigned this to the right team and they will be in touch with you directly within the SLA window. If you need to speak with someone before then, please reply to this message and I will arrange a call.`;
 
-I will follow up with you ${severity === "P0" ? "within 30 minutes" : severity === "P1" ? "within 2 hours" : severity === "P2" ? "by end of today" : "by tomorrow"}.
+    return `Hi ${firstName},
 
-${isUrgent ? "If you need to speak to someone urgently before then, please call me directly.\n\n" : ""}Kind regards,
+Thank you for raising this${severity === "P0" || severity === "P1" ? " — I want to personally acknowledge receipt and let you know this is being handled urgently" : ""}.
+
+${urgencyLine}
+
+${bodyLine}
+
+Kind regards,
 [Your name]
 Customer Success, LightWork AI`;
+  })();
 
-  const internalSlack = `🚨 ESCALATION — ${severity} | ${riskCategory}
-${"─".repeat(48)}
-CLIENT: ${c}${tier ? " | " + tier : ""}${arr ? " | " + arr : ""}${renewal ? " | Renewal: " + renewal : ""}
+  // ── Follow-up checklist ──────────────────────────────────────────────────────
+  const checklist = [];
+  if (flags.co) {
+    checklist.push(`Call ${reporterName} directly — do not rely on written communication for P0 safety incidents`);
+    checklist.push("Confirm tenant has evacuated and emergency services have been contacted");
+    checklist.push("Escalate Felicity's AI response to Product and Engineering as a critical AI behaviour incident");
+    checklist.push("Begin internal incident log — document timeline of events");
+  }
+  if (flags.gdpr) {
+    checklist.push("Notify DPO within 1 hour — 72-hour ICO window may have started");
+    checklist.push(`Identify full scope — how many tenants' data was exposed and across how many properties`);
+    checklist.push("Prepare draft ICO breach notification");
+    checklist.push("Freeze any automated messaging to affected tenants until root cause is confirmed");
+  }
+  if (flags.document && flags.mortgage) {
+    checklist.push("Retrieve tenancy agreement from system immediately — do not re-route through Felicity");
+    checklist.push(`Send directly to ${reporterName} and confirm receipt`);
+    checklist.push("Document mortgage deadline in CRM and set reminder");
+  }
+  if (isExec || flags.churnRisk) {
+    checklist.push(`CS Lead to make direct contact with ${reporterName} today`);
+    checklist.push("Prepare account health summary before any call");
+    if (isRenewalImminent) checklist.push(`Flag renewal risk to leadership — ${renewalText} window`);
+  }
+  if (flags.platform) {
+    checklist.push("Check deployment logs and correlate with any recent releases");
+    checklist.push(`Quantify affected tenant count and undelivered messages at ${clientName}`);
+    checklist.push("Check whether other accounts on same infrastructure are affected");
+  }
+  checklist.push(`Log escalation in CRM against ${clientName}`);
+  checklist.push(`Send acknowledgement to ${reporterName} within SLA: ${sla.split("·")[0].trim()}`);
+  checklist.push("Schedule follow-up to confirm full resolution");
+
+  // ── Immediate actions ────────────────────────────────────────────────────────
+  const actions = [];
+  if (severity === "P0") actions.push(`Call ${reporterName} immediately — ${reporterTitle} level contact requires direct phone response, not email`);
+  if (flags.co) actions.push("Escalate Felicity's CO response to Engineering and Product — log as critical AI behaviour incident");
+  if (flags.gdpr) actions.push("Notify DPO now and begin formal GDPR breach assessment");
+  if (isExec || flags.churnRisk) actions.push(`CS Lead or VP to contact ${reporterName} directly today — prepare account health summary first`);
+  if (flags.document && flags.mortgage) actions.push("Retrieve and send tenancy agreement today — bypass Felicity, send manually");
+  if (flags.platform) actions.push("Engineering to investigate root cause — check deployment logs and message queue health");
+  actions.push(`Create ${ROUTING_DESTINATIONS[teamId]?.ticketSystem || "CRM"} ticket and post to ${ROUTING_DESTINATIONS[teamId]?.channel || "#cs-escalations"}`);
+  actions.push(`Send client acknowledgement to ${reporterName} within SLA window`);
+
+  const dest = ROUTING_DESTINATIONS[teamId] || ROUTING_DESTINATIONS.cs;
+
+  return {
+    severity, severityReason, sla,
+    confidenceScore, confidenceReason,
+    riskCategory, team, additionalTeams,
+    signals,
+    routingJustification,
+    customerImpact, tenantImpact,
+    businessRisk,
+    executiveSummary,
+    suggestedResponse,
+    checklist, actions,
+    clientReply: suggestedResponse,
+    internalSlack: `🚨 ESCALATION — ${severity} | ${riskCategory} | Confidence: ${confidenceScore}%
+${"─".repeat(52)}
+CLIENT: ${clientName}${tierLabel ? " | " + tierLabel : ""}${arrValue ? " | " + arrValue : ""}${renewalText ? " | Renewal: " + renewalText : ""}
 REPORTED BY: ${reporter || "Unknown"}
 TRIAGED: ${now}
 ROUTE TO: ${team.label}${additionalTeams.length ? " + " + additionalTeams.join(", ") : ""}
 SLA: ${sla}
 
+EXECUTIVE SUMMARY:
+${executiveSummary}
+
 SEVERITY RATIONALE:
-${severityReason}
+${severityReason} (${confidenceScore}% confidence)
+
+WHY THIS WAS CLASSIFIED ${severity}:
+${signals.map(s => "• " + s).join("\n")}
+
+BUSINESS RISK:
+${businessRisk}
 
 CUSTOMER IMPACT:
 ${customerImpact}
@@ -263,18 +445,17 @@ TENANT IMPACT:
 ${tenantImpact}
 
 IMMEDIATE ACTIONS:
-${actions.map((a, i) => `${i + 1}. ${a}`).join("\n")}
+${actions.map((a, i) => (i+1) + ". " + a).join("\n")}
 
 FOLLOW-UP CHECKLIST:
-${checklist.map(c => `☐ ${c}`).join("\n")}
+${checklist.map(c => "☐ " + c).join("\n")}
 
 INTERNAL CONTEXT:
 ${context || "None provided"}
 
-⚠ All P0/P1 escalations must be reviewed by CS Lead before any automated response is sent.`;
-
-  const dest = ROUTING_DESTINATIONS[teamId] || ROUTING_DESTINATIONS.cs;
-  return { severity, severityReason, sla, riskCategory, team, additionalTeams, customerImpact, tenantImpact, checklist, actions, clientReply, internalSlack, timestamp: now, flags, dest };
+⚠ All P0/P1 outputs must be reviewed by CS Lead before action is taken.`,
+    timestamp: now, flags, dest
+  };
 }
 
 // ── Components ────────────────────────────────────────────────────────────────
@@ -455,80 +636,120 @@ export default function App() {
           {result && (
             <div id="triage-result" className="fade-up" style={{ marginTop: 28, display: "flex", flexDirection: "column", gap: 14 }}>
 
-              {/* Severity header */}
+              {/* Severity + Confidence header */}
               <div style={{ background: sev.bg, border: `1px solid ${sev.border}`, borderRadius: 12, padding: "18px 22px" }}>
                 <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
-                  <div>
-                    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6, flexWrap: "wrap" }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>
                       <span style={{ fontSize: 15, fontWeight: 700, color: sev.text, padding: "3px 10px", background: sev.border + "33", borderRadius: 20, border: `1px solid ${sev.border}` }}>{SEV_COLOR[result.severity].label}</span>
                       <span style={{ fontSize: 13, color: "#94a3b8" }}>{result.riskCategory}</span>
-                      {result.additionalTeams.length > 0 && <span style={{ fontSize: 12, color: "#64748b" }}>+ loop in: {result.additionalTeams.join(", ")}</span>}
+                      <span style={{ fontSize: 12, padding: "2px 8px", borderRadius: 20, background: "#0f172a", border: "1px solid #334155", color: result.confidenceScore >= 90 ? "#4ade80" : result.confidenceScore >= 80 ? "#fcd34d" : "#94a3b8" }}>
+                        {result.confidenceScore}% confidence
+                      </span>
                     </div>
-                    <div style={{ fontSize: 13, color: "#94a3b8", lineHeight: 1.6 }}>{result.severityReason}</div>
+                    <div style={{ fontSize: 13, color: "#94a3b8", lineHeight: 1.6, marginBottom: 6 }}>{result.severityReason}</div>
+                    <div style={{ fontSize: 12, color: "#64748b", fontStyle: "italic" }}>{result.confidenceReason}</div>
                   </div>
                   <div style={{ textAlign: "right", flexShrink: 0 }}>
                     <div style={{ fontSize: 11, color: "#475569", marginBottom: 3 }}>SLA</div>
                     <div style={{ fontSize: 12, color: sev.text, fontWeight: 600 }}>{result.sla.split("·")[0].trim()}</div>
-                    <div style={{ fontSize: 11, color: "#475569", marginTop: 4 }}>{result.timestamp}</div>
+                    <div style={{ fontSize: 11, color: "#475569", marginTop: 6 }}>{result.timestamp}</div>
                   </div>
                 </div>
+              </div>
+
+              {/* Why this was classified */}
+              <div style={{ background: "#0a0f1a", border: "1px solid #1e293b", borderRadius: 12, padding: "16px 18px" }}>
+                <div style={{ fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: .6, fontWeight: 500, marginBottom: 12 }}>Why this was classified {result.severity}</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+                  {result.signals.map((s, i) => (
+                    <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start", padding: "6px 8px", background: "#0f172a", borderRadius: 7, border: "1px solid #1e293b" }}>
+                      <span style={{ color: sev.text, fontSize: 12, flexShrink: 0 }}>✓</span>
+                      <span style={{ fontSize: 12, color: "#94a3b8", lineHeight: 1.5 }}>{s}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Executive summary */}
+              <div style={{ background: "#0a0f1a", border: `1px solid ${sev.border}44`, borderRadius: 12, padding: "16px 18px", borderLeft: `3px solid ${sev.border}` }}>
+                <div style={{ fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: .6, fontWeight: 500, marginBottom: 10 }}>Executive summary</div>
+                <div style={{ fontSize: 13, color: "#e2e8f0", lineHeight: 1.7, fontWeight: 400 }}>{result.executiveSummary}</div>
               </div>
 
               {/* Impact grid */}
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
                 <div style={{ background: "#0a0f1a", border: "1px solid #1e293b", borderRadius: 12, padding: "16px 18px" }}>
                   <div style={{ fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: .6, fontWeight: 500, marginBottom: 10 }}>Customer impact</div>
-                  <div style={{ fontSize: 13, color: "#cbd5e1", lineHeight: 1.65 }}>{result.customerImpact}</div>
+                  <div style={{ fontSize: 13, color: "#cbd5e1", lineHeight: 1.7 }}>{result.customerImpact}</div>
                 </div>
                 <div style={{ background: "#0a0f1a", border: "1px solid #1e293b", borderRadius: 12, padding: "16px 18px" }}>
                   <div style={{ fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: .6, fontWeight: 500, marginBottom: 10 }}>Tenant impact</div>
-                  <div style={{ fontSize: 13, color: "#cbd5e1", lineHeight: 1.65 }}>{result.tenantImpact}</div>
+                  <div style={{ fontSize: 13, color: "#cbd5e1", lineHeight: 1.7 }}>{result.tenantImpact}</div>
                 </div>
               </div>
 
-              {/* Routing + Actions */}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-                <div style={{ background: "#0a0f1a", border: "1px solid #1e293b", borderRadius: 12, padding: "16px 18px" }}>
-                  <div style={{ fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: .6, fontWeight: 500, marginBottom: 12 }}>Where this goes</div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-                    <span style={{ fontSize: 18 }}>{result.team.icon}</span>
-                    <span style={{ fontSize: 13, fontWeight: 600, color: result.team.color }}>{result.team.label}</span>
-                    <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 20, color: result.severity === "P0" ? "#fca5a5" : result.severity === "P1" ? "#fdba74" : "#86efac", border: "1px solid #334155", background: "#0f172a" }}>{result.severity === "P0" ? "Immediate" : result.severity === "P1" ? "Today" : "This week"}</span>
-                  </div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                    <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-                      <span style={{ fontSize: 11, color: "#475569", width: 80, flexShrink: 0, paddingTop: 1 }}>Channel</span>
-                      <span style={{ fontSize: 12, color: "#94a3b8", fontFamily: "DM Mono, monospace" }}>{result.dest.channel}</span>
-                    </div>
-                    <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-                      <span style={{ fontSize: 11, color: "#475569", width: 80, flexShrink: 0, paddingTop: 1 }}>Ticket</span>
-                      <span style={{ fontSize: 12, color: "#94a3b8" }}>{result.dest.ticketSystem}</span>
-                    </div>
-                    <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-                      <span style={{ fontSize: 11, color: "#475569", width: 80, flexShrink: 0, paddingTop: 1 }}>Owner</span>
-                      <span style={{ fontSize: 12, color: "#94a3b8" }}>{result.dest.escalateTo}</span>
-                    </div>
-                    {result.additionalTeams.length > 0 && (
-                      <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-                        <span style={{ fontSize: 11, color: "#475569", width: 80, flexShrink: 0, paddingTop: 1 }}>Loop in</span>
-                        <span style={{ fontSize: 12, color: "#64748b" }}>{result.additionalTeams.join(", ")}</span>
-                      </div>
-                    )}
-                  </div>
-                  <div style={{ marginTop: 12, padding: "8px 10px", background: "#0f172a", borderRadius: 7, border: "1px solid #1e293b" }}>
-                    <div style={{ fontSize: 11, color: "#475569", marginBottom: 3 }}>Action</div>
-                    <div style={{ fontSize: 12, color: "#cbd5e1", lineHeight: 1.5 }}>{result.dest.action}</div>
-                  </div>
-                </div>
-                <div style={{ background: "#0a0f1a", border: "1px solid #1e293b", borderRadius: 12, padding: "16px 18px" }}>
-                  <div style={{ fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: .6, fontWeight: 500, marginBottom: 10 }}>Immediate actions</div>
-                  {result.actions.slice(0, 4).map((a, i) => (
-                    <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start", marginBottom: 7 }}>
-                      <div style={{ width: 18, height: 18, borderRadius: "50%", background: "#1e293b", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 600, color: "#64748b", flexShrink: 0, marginTop: 1 }}>{i + 1}</div>
-                      <span style={{ fontSize: 12, color: "#cbd5e1", lineHeight: 1.5 }}>{a}</span>
+              {/* Business risk assessment */}
+              <div style={{ background: "#0a0f1a", border: "1px solid #1e293b", borderRadius: 12, padding: "16px 18px" }}>
+                <div style={{ fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: .6, fontWeight: 500, marginBottom: 10 }}>Business risk assessment</div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+                  {result.dest && [
+                    form.arr && { label: "ARR", val: form.arr },
+                    form.tier && { label: "Tier", val: form.tier },
+                    form.renewal && { label: "Renewal", val: form.renewal },
+                  ].filter(Boolean).map((m, i) => (
+                    <div key={i} style={{ padding: "4px 10px", background: "#0f172a", borderRadius: 6, border: "1px solid #1e293b" }}>
+                      <span style={{ fontSize: 10, color: "#475569" }}>{m.label}: </span>
+                      <span style={{ fontSize: 12, color: "#94a3b8", fontWeight: 500 }}>{m.val}</span>
                     </div>
                   ))}
                 </div>
+                <div style={{ fontSize: 13, color: "#cbd5e1", lineHeight: 1.7 }}>{result.businessRisk}</div>
+              </div>
+
+              {/* Routing + justification */}
+              <div style={{ background: "#0a0f1a", border: "1px solid #1e293b", borderRadius: 12, padding: "16px 18px" }}>
+                <div style={{ fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: .6, fontWeight: 500, marginBottom: 14 }}>Routing justification</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                  {Object.entries(result.routingJustification).map(([teamName, reasons]) => (
+                    <div key={teamName} style={{ padding: "10px 12px", background: "#0f172a", borderRadius: 8, border: "1px solid #1e293b" }}>
+                      <div style={{ fontSize: 12, fontWeight: 600, color: "#e2e8f0", marginBottom: 7 }}>{teamName}</div>
+                      {reasons.map((r, i) => (
+                        <div key={i} style={{ display: "flex", gap: 7, alignItems: "flex-start", marginBottom: 4 }}>
+                          <span style={{ color: "#475569", fontSize: 11, flexShrink: 0, marginTop: 2 }}>•</span>
+                          <span style={{ fontSize: 12, color: "#94a3b8", lineHeight: 1.5 }}>{r}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                  <div style={{ padding: "10px 12px", background: "#0f172a", borderRadius: 8, border: "1px solid #1e293b" }}>
+                    <div style={{ fontSize: 11, color: "#475569", marginBottom: 6 }}>Send to</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      {[
+                        { label: "Channel", val: result.dest.channel },
+                        { label: "Ticket", val: result.dest.ticketSystem },
+                        { label: "Owner", val: result.dest.escalateTo },
+                      ].map((r, i) => (
+                        <div key={i} style={{ display: "flex", gap: 8 }}>
+                          <span style={{ fontSize: 11, color: "#475569", width: 52, flexShrink: 0 }}>{r.label}</span>
+                          <span style={{ fontSize: 12, color: "#94a3b8", fontFamily: r.label === "Channel" ? "DM Mono, monospace" : "inherit" }}>{r.val}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ marginTop: 8, fontSize: 12, color: "#cbd5e1", lineHeight: 1.5, borderTop: "1px solid #1e293b", paddingTop: 8 }}>{result.dest.action}</div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Immediate actions */}
+              <div style={{ background: "#0a0f1a", border: "1px solid #1e293b", borderRadius: 12, padding: "16px 18px" }}>
+                <div style={{ fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: .6, fontWeight: 500, marginBottom: 12 }}>Immediate actions</div>
+                {result.actions.map((a, i) => (
+                  <div key={i} style={{ display: "flex", gap: 10, alignItems: "flex-start", marginBottom: 8 }}>
+                    <div style={{ width: 20, height: 20, borderRadius: "50%", background: i === 0 ? sev.border + "44" : "#1e293b", border: `1px solid ${i === 0 ? sev.border : "#334155"}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 700, color: i === 0 ? sev.text : "#64748b", flexShrink: 0, marginTop: 1 }}>{i + 1}</div>
+                    <span style={{ fontSize: 13, color: i === 0 ? "#e2e8f0" : "#cbd5e1", lineHeight: 1.55, fontWeight: i === 0 ? 500 : 400 }}>{a}</span>
+                  </div>
+                ))}
               </div>
 
               {/* Checklist */}
@@ -548,27 +769,27 @@ export default function App() {
               <div style={{ background: "#0a0f1a", border: "1px solid #1e293b", borderRadius: 12, padding: "16px 18px" }}>
                 <div style={{ display: "flex", borderBottom: "1px solid #0f172a", marginBottom: 16, justifyContent: "space-between", alignItems: "center" }}>
                   <div style={{ display: "flex" }}>
-                    {[{ id: "client", label: "Client reply draft" }, { id: "slack", label: "Internal escalation" }].map(t => (
+                    {[{ id: "client", label: "Suggested customer response" }, { id: "slack", label: "Internal escalation" }].map(t => (
                       <button key={t.id} onClick={() => setTab(t.id)}
-                        style={{ fontSize: 12, padding: "8px 16px", border: "none", borderBottom: tab === t.id ? "2px solid #3b82f6" : "2px solid transparent", background: "transparent", color: tab === t.id ? "#e2e8f0" : "#475569", cursor: "pointer", fontWeight: tab === t.id ? 600 : 400, marginBottom: -1 }}>
+                        style={{ fontSize: 12, padding: "8px 14px", border: "none", borderBottom: tab === t.id ? `2px solid ${sev.border}` : "2px solid transparent", background: "transparent", color: tab === t.id ? "#e2e8f0" : "#475569", cursor: "pointer", fontWeight: tab === t.id ? 600 : 400, marginBottom: -1 }}>
                         {t.label}
                       </button>
                     ))}
                   </div>
-                  <CopyBtn getText={() => tab === "client" ? editableReply : editableSlack} label={tab === "client" ? "Copy reply" : "Copy escalation"} />
+                  <CopyBtn getText={() => tab === "client" ? editableReply : editableSlack} label={tab === "client" ? "Copy response" : "Copy escalation"} />
                 </div>
                 {tab === "client" && (
                   <div>
-                    <div style={{ fontSize: 11, color: "#475569", marginBottom: 10 }}>Edit below before sending — do not send P0/P1 drafts without CS Lead review</div>
+                    <div style={{ fontSize: 11, color: "#475569", marginBottom: 10 }}>Dynamically generated from the specific details of this escalation. Edit before sending — do not send P0/P1 without CS Lead review.</div>
                     <textarea value={editableReply} onChange={e => setEditableReply(e.target.value)}
                       style={{ width: "100%", minHeight: 220, background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, padding: "14px 16px", fontSize: 13, color: "#cbd5e1", lineHeight: 1.75, resize: "vertical", fontFamily: "inherit", boxSizing: "border-box" }} />
                   </div>
                 )}
                 {tab === "slack" && (
                   <div>
-                    <div style={{ fontSize: 11, color: "#475569", marginBottom: 10 }}>Edit below — tag owners before posting to #escalations</div>
+                    <div style={{ fontSize: 11, color: "#475569", marginBottom: 10 }}>Edit below — tag owners before posting to {result.dest.channel}</div>
                     <textarea value={editableSlack} onChange={e => setEditableSlack(e.target.value)}
-                      style={{ width: "100%", minHeight: 220, background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, padding: "14px 16px", fontSize: 13, color: "#cbd5e1", lineHeight: 1.75, resize: "vertical", fontFamily: "DM Mono, monospace", boxSizing: "border-box" }} />
+                      style={{ width: "100%", minHeight: 300, background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, padding: "14px 16px", fontSize: 12, color: "#cbd5e1", lineHeight: 1.75, resize: "vertical", fontFamily: "DM Mono, monospace", boxSizing: "border-box" }} />
                   </div>
                 )}
               </div>
@@ -578,11 +799,9 @@ export default function App() {
                 <span style={{ fontSize: 18, flexShrink: 0 }}>🤖</span>
                 <div style={{ fontSize: 12, color: "#475569", lineHeight: 1.65 }}>
                   <strong style={{ color: "#64748b" }}>How AI automates this: </strong>
-                  The triage engine reads unstructured escalation text and in under one second: detects risk signals (safety, GDPR, legal, churn, platform failure), classifies severity (P0–P3), generates customer and tenant impact statements, assigns SLA, routes to the right team, produces a follow-up checklist, and drafts both a client reply and internal escalation. A task that takes a CS manager 20–30 minutes of reading, thinking, and writing is reduced to a single click. The CSM reviews and edits the outputs — the AI handles the classification and first draft.
-                  <strong style={{ color: "#64748b" }}> All P0 and P1 outputs must be reviewed before sending.</strong>
+                  The triage engine reads unstructured escalation text and in under one second detects risk signals, classifies severity with a confidence score, generates dynamic impact statements and an executive summary that directly reference the specific client, reporter, ARR, renewal window, and issue details — not generic templates. Every output is specific to this escalation. A task that takes a CS manager 20–30 minutes is reduced to a single click. <strong style={{ color: "#64748b" }}>All P0 and P1 outputs must be reviewed before sending.</strong>
                 </div>
               </div>
-
               <button onClick={reset} style={{ padding: "10px", border: "1px solid #1e293b", borderRadius: 10, background: "transparent", fontSize: 13, color: "#475569", cursor: "pointer" }}>
                 ← Triage another issue
               </button>
