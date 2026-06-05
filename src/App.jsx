@@ -25,12 +25,6 @@ const PRESETS = {
     reporter:"Sarah Kim, Head of Operations", renewal:"6 weeks",
     issue:`Our automation rate has fallen from 84% to 41% over the past 48 hours. Tenants are complaining about delayed responses and our team is overwhelmed handling tickets manually. We had 340 unresolved queries at 9am this morning. This is completely unacceptable — what is going on?`,
     context:"Deployment pushed Friday evening v2.3.1 — new NLP model update. No alerts fired on our side."
-  },
-  angry_exec: {
-    client:"Apex Living", tier:"Enterprise", arr:"£95,000",
-    reporter:"James Okafor, CEO", renewal:"6 weeks",
-    issue:`I'm personally reaching out because I'm extremely unhappy with the service we've received over the last month. Response times have been terrible, our CSM doesn't reply within the same day, and I'm seeing no improvement in our automation metrics. I'm questioning whether we made the right decision switching to LightWork. I'd like to speak to someone senior this week.`,
-    context:"Account up for renewal in 6 weeks. CSM has been on leave — cover not communicated to client."
   }
 };
 
@@ -41,6 +35,66 @@ const TEAMS = [
   { id:"ops",         label:"Operations",        icon:"🔧",  desc:"Config, integrations, data",   color:"#16a34a", bg:"#f0fdf4", border:"#86efac" },
   { id:"leadership",  label:"Leadership",        icon:"⭐",  desc:"Exec escalation, legal, GDPR", color:"#dc2626", bg:"#fef2f2", border:"#fca5a5" },
 ];
+
+// ── Gibberish / unrecognised input detection ─────────────────────────────────
+function isUnrecognisedInput(text) {
+  const t = text.trim();
+  if (t.length < 20) return { bad: true, reason: "Input is too short to triage. Please paste the full client message or describe the issue in detail." };
+
+  // Repeat character spam: e.g. "aaaaaaa" or "asdfasdf"
+  const noSpaces = t.replace(/\s/g, "");
+  const uniqueChars = new Set(noSpaces.toLowerCase()).size;
+  if (noSpaces.length > 15 && uniqueChars < 5) return { bad: true, reason: "Input does not appear to be a real escalation message. Please paste the client's actual message." };
+
+  // Keyboard mash: high ratio of uncommon letter combos
+  const mashPattern = /([qwrtypsdfghjklzxcvbnm]){3,}|[^a-zA-Z0-9\s.,!?'"-]{4,}/i;
+  if (mashPattern.test(t)) return { bad: true, reason: "Input contains unrecognised characters or keyboard noise. Please enter a real escalation message." };
+
+  // Too few real words (less than 4 dictionary-like tokens)
+  const words = t.match(/[a-zA-Z]{3,}/g) || [];
+  if (words.length < 4) return { bad: true, reason: "Not enough context to triage. Please describe the issue in full sentences." };
+
+  // No recognisable CS/property context at all
+  const hasContext = /tenant|client|property|building|flat|unit|lease|repair|message|felicity|response|issue|problem|complaint|urgent|request|contract|data|invoice|payment|support|broken|failed|error|not working|help/i.test(t);
+  if (!hasContext) return { bad: true, reason: "The input doesn't appear to relate to a property management or LightWork issue. Please paste the actual client escalation message." };
+
+  return { bad: false };
+}
+
+// ── Specific routing destinations ─────────────────────────────────────────────
+// Maps team selection to specific named contacts, channels, and ticket systems
+const ROUTING_DESTINATIONS = {
+  engineering: {
+    channel: "#eng-incidents",
+    ticketSystem: "Linear — Engineering board",
+    escalateTo: "On-call engineer + Engineering Lead",
+    action: "Create a Linear ticket tagged [CS-Escalation] and post in #eng-incidents with @eng-oncall"
+  },
+  cs: {
+    channel: "#cs-escalations",
+    ticketSystem: "HubSpot — CS queue",
+    escalateTo: "CS Lead (Lola Amidu)",
+    action: "Log in HubSpot and post in #cs-escalations — CS Lead to take ownership within SLA window"
+  },
+  product: {
+    channel: "#product-feedback",
+    ticketSystem: "Linear — Product board",
+    escalateTo: "Head of Product",
+    action: "Create a Linear ticket tagged [AI-Behaviour] and post summary in #product-feedback with @product-lead"
+  },
+  ops: {
+    channel: "#ops-support",
+    ticketSystem: "Linear — Ops board",
+    escalateTo: "Operations Manager",
+    action: "Create an Ops ticket in Linear and post in #ops-support — assign to Operations Manager"
+  },
+  leadership: {
+    channel: "#leadership-escalations",
+    ticketSystem: "Direct notification",
+    escalateTo: "CEO / VP Customer Success",
+    action: "Direct message to VP CS and CEO — do not post publicly. Prepare a one-page incident summary."
+  }
+};
 
 // ── AI Triage Engine ──────────────────────────────────────────────────────────
 // This is where the automation happens. The engine reads the raw escalation text
@@ -219,7 +273,8 @@ ${context || "None provided"}
 
 ⚠ All P0/P1 escalations must be reviewed by CS Lead before any automated response is sent.`;
 
-  return { severity, severityReason, sla, riskCategory, team, additionalTeams, customerImpact, tenantImpact, checklist, actions, clientReply, internalSlack, timestamp: now, flags };
+  const dest = ROUTING_DESTINATIONS[teamId] || ROUTING_DESTINATIONS.cs;
+  return { severity, severityReason, sla, riskCategory, team, additionalTeams, customerImpact, tenantImpact, checklist, actions, clientReply, internalSlack, timestamp: now, flags, dest };
 }
 
 // ── Components ────────────────────────────────────────────────────────────────
@@ -260,6 +315,8 @@ export default function App() {
   const runTriage = () => {
     if (!form.issue.trim()) { setError("Please enter an issue description."); return; }
     if (!selectedTeam) { setError("Please select a team to route this to."); return; }
+    const check = isUnrecognisedInput(form.issue);
+    if (check.bad) { setError(check.reason); return; }
     setError("");
     const r = runTriageEngine(form.issue, form.client, form.tier, form.arr, form.reporter, form.renewal, form.context, selectedTeam);
     setResult(r);
@@ -321,8 +378,7 @@ export default function App() {
                 { key: "data_breach",     label: "🔒 Data breach" },
                 { key: "tenancy_doc",     label: "📄 Tenancy document" },
                 { key: "automation_drop", label: "📉 Automation drop" },
-                { key: "angry_exec",      label: "😤 Angry executive" },
-              ].map(p => (
+].map(p => (
                 <button key={p.key} onClick={() => loadPreset(p.key)}
                   style={{ fontSize: 12, padding: "5px 12px", border: "1px solid #1e293b", borderRadius: 20, background: "#0f172a", color: "#94a3b8", cursor: "pointer" }}
                   onMouseEnter={e => { e.currentTarget.style.borderColor = "#3b82f6"; e.currentTarget.style.color = "#e2e8f0"; }}
@@ -433,16 +489,36 @@ export default function App() {
               {/* Routing + Actions */}
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
                 <div style={{ background: "#0a0f1a", border: "1px solid #1e293b", borderRadius: 12, padding: "16px 18px" }}>
-                  <div style={{ fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: .6, fontWeight: 500, marginBottom: 10 }}>Routing</div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                  <div style={{ fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: .6, fontWeight: 500, marginBottom: 12 }}>Where this goes</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
                     <span style={{ fontSize: 18 }}>{result.team.icon}</span>
                     <span style={{ fontSize: 13, fontWeight: 600, color: result.team.color }}>{result.team.label}</span>
-                    <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 20, background: result.sev === "P0" ? "#450a0a" : "#0f172a", color: result.severity === "P0" ? "#fca5a5" : result.severity === "P1" ? "#fdba74" : "#86efac", border: "1px solid #334155" }}>{result.severity === "P0" ? "Immediate" : result.severity === "P1" ? "Today" : "This week"}</span>
+                    <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 20, color: result.severity === "P0" ? "#fca5a5" : result.severity === "P1" ? "#fdba74" : "#86efac", border: "1px solid #334155", background: "#0f172a" }}>{result.severity === "P0" ? "Immediate" : result.severity === "P1" ? "Today" : "This week"}</span>
                   </div>
-                  {result.additionalTeams.length > 0 && (
-                    <div style={{ fontSize: 12, color: "#64748b" }}>Also loop in: {result.additionalTeams.join(", ")}</div>
-                  )}
-                  <div style={{ marginTop: 12, fontSize: 12, color: "#64748b", lineHeight: 1.5 }}>{result.sla}</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                      <span style={{ fontSize: 11, color: "#475569", width: 80, flexShrink: 0, paddingTop: 1 }}>Channel</span>
+                      <span style={{ fontSize: 12, color: "#94a3b8", fontFamily: "DM Mono, monospace" }}>{result.dest.channel}</span>
+                    </div>
+                    <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                      <span style={{ fontSize: 11, color: "#475569", width: 80, flexShrink: 0, paddingTop: 1 }}>Ticket</span>
+                      <span style={{ fontSize: 12, color: "#94a3b8" }}>{result.dest.ticketSystem}</span>
+                    </div>
+                    <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                      <span style={{ fontSize: 11, color: "#475569", width: 80, flexShrink: 0, paddingTop: 1 }}>Owner</span>
+                      <span style={{ fontSize: 12, color: "#94a3b8" }}>{result.dest.escalateTo}</span>
+                    </div>
+                    {result.additionalTeams.length > 0 && (
+                      <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                        <span style={{ fontSize: 11, color: "#475569", width: 80, flexShrink: 0, paddingTop: 1 }}>Loop in</span>
+                        <span style={{ fontSize: 12, color: "#64748b" }}>{result.additionalTeams.join(", ")}</span>
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ marginTop: 12, padding: "8px 10px", background: "#0f172a", borderRadius: 7, border: "1px solid #1e293b" }}>
+                    <div style={{ fontSize: 11, color: "#475569", marginBottom: 3 }}>Action</div>
+                    <div style={{ fontSize: 12, color: "#cbd5e1", lineHeight: 1.5 }}>{result.dest.action}</div>
+                  </div>
                 </div>
                 <div style={{ background: "#0a0f1a", border: "1px solid #1e293b", borderRadius: 12, padding: "16px 18px" }}>
                   <div style={{ fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: .6, fontWeight: 500, marginBottom: 10 }}>Immediate actions</div>
